@@ -20,7 +20,7 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import imageio
 
-from transformers import CLIPModel, CLIPProcessor
+from transformers import CLIPModel, CLIPProcessor, logging as hf_logging
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
@@ -290,20 +290,47 @@ class RSSM(nn.Module):
 class CLIPScorer:
     def __init__(self, device: torch.device, model_name: str = "openai/clip-vit-base-patch32"):
         self.device = device
-        self.processor = CLIPProcessor.from_pretrained(model_name)
-        self.model = CLIPModel.from_pretrained(model_name).to(device)
+        # In Colab, explicit token=False prevents noisy secret lookup warnings if HF_TOKEN is not set.
+        hf_token = os.getenv("HF_TOKEN") or False
+
+        # Compatibility across transformers versions: some use token=..., some use use_auth_token=...
+        try:
+            self.processor = CLIPProcessor.from_pretrained(model_name, use_fast=False, token=hf_token)
+        except TypeError:
+            if hf_token:
+                self.processor = CLIPProcessor.from_pretrained(model_name, use_fast=False, use_auth_token=hf_token)
+            else:
+                self.processor = CLIPProcessor.from_pretrained(model_name, use_fast=False)
+
+        prev_verbosity = hf_logging.get_verbosity()
+        hf_logging.set_verbosity_error()
+        try:
+            try:
+                self.model = CLIPModel.from_pretrained(model_name, token=hf_token).to(device)
+            except TypeError:
+                if hf_token:
+                    self.model = CLIPModel.from_pretrained(model_name, use_auth_token=hf_token).to(device)
+                else:
+                    self.model = CLIPModel.from_pretrained(model_name).to(device)
+        finally:
+            hf_logging.set_verbosity(prev_verbosity)
         self.model.eval()
 
     @torch.no_grad()
-    def score_images(self, images: List[np.ndarray], text: str) -> torch.Tensor:
-        pil_images = [Image.fromarray(img) for img in images]
-        inputs = self.processor(text=[text] * len(pil_images), images=pil_images,
-                                return_tensors="pt", padding=True)
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        outputs = self.model(**inputs)
-        logits = outputs.logits_per_image.squeeze(-1)  # [B]
-        # squash to roughly [-1,1] for stability
-        return torch.tanh(logits / 10.0).detach().cpu()
+    def score_images(self, images: List[np.ndarray], text: str, batch_size: int = 64) -> torch.Tensor:
+        if len(images) == 0:
+            return torch.empty(0, dtype=torch.float32)
+        scores = []
+        for i in range(0, len(images), batch_size):
+            chunk = images[i:i + batch_size]
+            pil_images = [Image.fromarray(img) for img in chunk]
+            # One shared text prompt for all imagined frames -> logits_per_image shape [B, 1].
+            inputs = self.processor(text=[text], images=pil_images, return_tensors="pt", padding=True)
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            outputs = self.model(**inputs)
+            logits = outputs.logits_per_image[:, 0]  # [B]
+            scores.append(torch.tanh(logits / 10.0).detach().cpu())
+        return torch.cat(scores, dim=0)
 
 
 # =========================
@@ -384,7 +411,8 @@ def train_rssm(
 
     opt = torch.optim.Adam(rssm.parameters(), lr=cfg.lr)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and device.type == "cuda"))
+    amp_device_type = "cuda" if device.type == "cuda" else "cpu"
+    scaler = torch.amp.GradScaler(amp_device_type, enabled=(use_amp and device.type == "cuda"))
 
     rssm.train()
 
@@ -418,7 +446,7 @@ def train_rssm(
 
             opt.zero_grad(set_to_none=True)
 
-            with torch.cuda.amp.autocast(enabled=(use_amp and device.type == "cuda")):
+            with torch.amp.autocast(amp_device_type, enabled=(use_amp and device.type == "cuda")):
                 for t in range(L):
                     h, z, (pr_m, pr_s, po_m, po_s) = rssm.observe_step(h, z, a_prev_oh, obs_t[:, t])
 
@@ -473,6 +501,8 @@ class PlanConfig:
     horizon: int = 15
     num_candidates: int = 256
     gamma: float = 0.99
+    vlm_batch_size: int = 64
+    vlm_score_stride: int = 2
 
 @torch.no_grad()
 def mpc_action(
@@ -520,10 +550,12 @@ def mpc_action(
                 r_pred, _ = rssm.predict_reward_continue(hk, zk)
                 G += discount * float(r_pred.item())
             else:
-                recon = rssm.decode(hk, zk)
-                img = (recon.squeeze(0).permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
-                all_images.append(img)
-                img_index_map.append((k, t))
+                # Subsample imagined frames for VLM scoring to keep MPC responsive.
+                if (t % plan_cfg.vlm_score_stride == 0) or (t == H - 1):
+                    recon = rssm.decode(hk, zk)
+                    img = (recon.squeeze(0).permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
+                    all_images.append(img)
+                    img_index_map.append((k, t))
 
             discount *= plan_cfg.gamma
 
@@ -531,7 +563,7 @@ def mpc_action(
             objectives[k] = G
 
     if mode == "wm_vlm":
-        scores = scorer.score_images(all_images, goal_text).numpy()
+        scores = scorer.score_images(all_images, goal_text, batch_size=plan_cfg.vlm_batch_size).numpy().reshape(-1)
         for idx, (k, t) in enumerate(img_index_map):
             objectives[k] += (plan_cfg.gamma ** t) * float(scores[idx])
 
@@ -657,6 +689,8 @@ def evaluate_all(
 
     methods = ["random", "wm_reward", "wm_vlm"]
     stats = {m: {"returns": [], "success": []} for m in methods}
+    total_runs = len(eval_cfg.seeds) * eval_cfg.episodes_per_seed * len(methods)
+    pbar = tqdm(total=total_runs, desc="Evaluate policies")
 
     for seed in eval_cfg.seeds:
         env = make_env(eval_cfg.env_id, seed)
@@ -675,6 +709,7 @@ def evaluate_all(
             stats["random"]["success"].append(S)
             if eval_cfg.save_gifs:
                 save_gif(frames, os.path.join(eval_cfg.out_dir, "gifs", f"random_seed{seed}_ep{ep}.gif"))
+            pbar.update(1)
 
             # World-model planning WITHOUT VLM (objective: predicted reward)
             R, S, frames = run_episode(env, wm_reward_pi, eval_cfg.max_ep_len, reset_seed=ep_seed)
@@ -682,6 +717,7 @@ def evaluate_all(
             stats["wm_reward"]["success"].append(S)
             if eval_cfg.save_gifs:
                 save_gif(frames, os.path.join(eval_cfg.out_dir, "gifs", f"wm_reward_seed{seed}_ep{ep}.gif"))
+            pbar.update(1)
 
             # World-model planning + VLM scorer
             R, S, frames = run_episode(env, wm_vlm_pi, eval_cfg.max_ep_len, reset_seed=ep_seed)
@@ -689,8 +725,10 @@ def evaluate_all(
             stats["wm_vlm"]["success"].append(S)
             if eval_cfg.save_gifs:
                 save_gif(frames, os.path.join(eval_cfg.out_dir, "gifs", f"wm_vlm_seed{seed}_ep{ep}.gif"))
+            pbar.update(1)
 
         env.close()
+    pbar.close()
 
     results = {}
     for m in methods:
@@ -855,8 +893,9 @@ def main():
     else:  # cuda
         steps = 50_000
         epochs = 4
-        num_candidates = 192
-        horizon = 15
+        # Keep planning budget moderate: wm_vlm mode is expensive because CLIP scores imagined futures.
+        num_candidates = 96
+        horizon = 12
         episodes_per_seed = 4
         batch_size = 64
         seq_len = 32
