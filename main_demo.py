@@ -891,8 +891,8 @@ def main():
         batch_size = 32
         seq_len = 32
     else:  # cuda
-        steps = 50_000
-        epochs = 4
+        steps = 100
+        epochs = 1
         # Keep planning budget moderate: wm_vlm mode is expensive because CLIP scores imagined futures.
         num_candidates = 96
         horizon = 12
