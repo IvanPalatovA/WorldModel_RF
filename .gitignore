@@ -1,0 +1,13 @@
+__pycache__/
+.DS_Store
+.vscode/
+
+# LaTeX
+*.tex
+
+# Generated reports/media
+figures/
+
+.DS_Store
+__pycache__/
+*.pyc

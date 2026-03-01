@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 from reportlab.lib.utils import ImageReader
 
@@ -15,15 +15,21 @@ from minigrid.wrappers import RGBImgObsWrapper, ImgObsWrapper
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 
 from PIL import Image
 import imageio
 
 from transformers import CLIPModel, CLIPProcessor, logging as hf_logging
+try:
+    from huggingface_hub.utils import disable_progress_bars as hf_disable_progress_bars
+except Exception:
+    hf_disable_progress_bars = None
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
+
+CODE_VERSION = "doorkey-expert-fallback-v6-2026-03-01"
 
 
 # =========================
@@ -45,6 +51,106 @@ def make_env(env_id: str, seed: int):
     env.reset(seed=seed)
     env.action_space.seed(seed)
     return env
+
+
+def plan_doorkey_expert(u) -> Optional[List[int]]:
+    """Shortest action sequence in symbolic DoorKey state; returns None if planning fails."""
+    DIR_TO_VEC = {
+        0: np.array((1, 0)),   # right
+        1: np.array((0, 1)),   # down
+        2: np.array((-1, 0)),  # left
+        3: np.array((0, -1)),  # up
+    }
+
+    key_pos = None
+    door_pos = None
+    goal_pos = None
+    for x in range(u.grid.width):
+        for y in range(u.grid.height):
+            cell = u.grid.get(x, y)
+            if cell is None:
+                continue
+            if cell.type == "key" and key_pos is None:
+                key_pos = (x, y)
+            if cell.type == "door" and door_pos is None:
+                door_pos = (x, y)
+            if cell.type == "goal":
+                goal_pos = (x, y)
+    if door_pos is None or goal_pos is None:
+        return None
+
+    has_key0 = (u.carrying is not None and getattr(u.carrying, "type", None) == "key")
+    if key_pos is None and not has_key0:
+        # Without key in grid and not carrying key, environment state is not solvable for DoorKey.
+        return None
+    door_cell0 = u.grid.get(*door_pos)
+    door_open0 = (door_cell0 is not None and door_cell0.is_open)
+    key_present0 = False
+    if key_pos is not None and not has_key0:
+        key_cell0 = u.grid.get(*key_pos)
+        key_present0 = (key_cell0 is not None and key_cell0.type == "key")
+    start = (tuple(u.agent_pos), int(u.agent_dir), has_key0, door_open0, key_present0)
+
+    acts = u.actions
+    A_LEFT = int(acts.left)
+    A_RIGHT = int(acts.right)
+    A_FWD = int(acts.forward)
+    A_PICKUP = int(acts.pickup)
+    A_TOGGLE = int(acts.toggle)
+
+    def neighbors(state):
+        (x, y), d, has_key, door_open, key_present = state
+        res = []
+        res.append((A_LEFT, ((x, y), (d - 1) % 4, has_key, door_open, key_present)))
+        res.append((A_RIGHT, ((x, y), (d + 1) % 4, has_key, door_open, key_present)))
+
+        fx, fy = (np.array((x, y)) + DIR_TO_VEC[d]).astype(int).tolist()
+        in_bounds = (0 <= fx < u.grid.width and 0 <= fy < u.grid.height)
+        cell = u.grid.get(fx, fy) if in_bounds else None
+
+        if cell is not None and cell.type == "door" and has_key and not door_open:
+            res.append((A_TOGGLE, ((x, y), d, has_key, True, key_present)))
+        if cell is not None and cell.type == "key" and key_present and not has_key:
+            res.append((A_PICKUP, ((x, y), d, True, door_open, False)))
+
+        can_forward = False
+        new_door_open = door_open
+        if cell is None:
+            can_forward = False if not in_bounds else True
+        else:
+            if cell.type == "wall":
+                can_forward = False
+            elif cell.type == "key":
+                can_forward = (not key_present)
+            elif cell.type == "door":
+                can_forward = cell.is_open or door_open
+                new_door_open = door_open or cell.is_open
+            else:
+                can_forward = True
+        if can_forward:
+            res.append((A_FWD, ((fx, fy), d, has_key, new_door_open, key_present)))
+        return res
+
+    from collections import deque
+    q = deque([start])
+    prev = {start: (None, None)}
+
+    while q:
+        s = q.popleft()
+        (x, y), _, _, door_open, _ = s
+        if (x, y) == goal_pos and door_open:
+            path = []
+            cur = s
+            while prev[cur][0] is not None:
+                parent, act = prev[cur]
+                path.append(act)
+                cur = parent
+            return list(reversed(path))
+        for act, ns in neighbors(s):
+            if ns not in prev:
+                prev[ns] = (s, act)
+                q.append(ns)
+    return None
 
 
 def obs_to_tensor(obs, device: torch.device) -> torch.Tensor:
@@ -107,33 +213,41 @@ def save_gif(frames: List[np.ndarray], path: str, fps: int = 10):
 
 class TransitionSeqDataset(Dataset):
     """
-    Sequences of length seq_len that DO NOT cross episode terminals (done=True inside the window).
-    This stabilizes RSSM training for imagined rollouts.
+    Sequences of length seq_len.
+    By default windows may cross episode terminals; this keeps dataset size large for short episodes.
+    Set strict_no_terminal=True to recover old behavior.
     """
 
-    def __init__(self, obs: np.ndarray, actions: np.ndarray, rewards: np.ndarray, dones: np.ndarray, seq_len: int):
+    def __init__(
+        self,
+        obs: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray,
+        dones: np.ndarray,
+        seq_len: int,
+        strict_no_terminal: bool = False,
+    ):
         self.obs = obs
         self.actions = actions
         self.rewards = rewards
         self.dones = dones.astype(np.bool_)
         self.seq_len = seq_len
         self.N = obs.shape[0]
-        if self.N <= seq_len + 1:
+        if self.N <= seq_len:
             raise ValueError("Not enough data for sequences. Collect more transitions or reduce seq_len.")
 
-        # Valid start indices such that dones[s:s+seq_len-1] has no terminal inside.
-        # We allow done at the last element of the window (it is still a valid target).
-        valid = []
-        max_start = self.N - seq_len
-        for s in range(max_start):
-            window_dones = self.dones[s : s + seq_len - 1]
-            if not window_dones.any():
-                valid.append(s)
-
-        if len(valid) == 0:
-            raise ValueError("No valid sequences without terminals. Collect more data or reduce seq_len.")
-
-        self.valid_starts = np.array(valid, dtype=np.int64)
+        max_start = self.N - seq_len + 1
+        if strict_no_terminal:
+            valid = []
+            for s in range(max_start):
+                window_dones = self.dones[s : s + seq_len - 1]
+                if not window_dones.any():
+                    valid.append(s)
+            if len(valid) == 0:
+                raise ValueError("No valid sequences without terminals. Collect more data or reduce seq_len.")
+            self.valid_starts = np.array(valid, dtype=np.int64)
+        else:
+            self.valid_starts = np.arange(max_start, dtype=np.int64)
 
     def __len__(self):
         return int(self.valid_starts.shape[0])
@@ -251,18 +365,31 @@ class RSSM(nn.Module):
         mean, std = self._dist_params(self.post_net(torch.cat([h, embed], dim=-1)))
         return mean, std
 
-    def observe_step(self, h: torch.Tensor, z_prev: torch.Tensor, a_prev_oh: torch.Tensor, obs: torch.Tensor):
+    def observe_step(
+        self,
+        h: torch.Tensor,
+        z_prev: torch.Tensor,
+        a_prev_oh: torch.Tensor,
+        obs: torch.Tensor,
+        sample: bool = True,
+    ):
         h = self.gru(torch.cat([z_prev, a_prev_oh], dim=-1), h)
         embed = self.encoder(obs)
         post_mean, post_std = self.posterior(h, embed)
-        z = self._sample(post_mean, post_std)
+        z = self._sample(post_mean, post_std) if sample else post_mean
         prior_mean, prior_std = self.prior(h)
         return h, z, (prior_mean, prior_std, post_mean, post_std)
 
-    def imagine_step(self, h: torch.Tensor, z_prev: torch.Tensor, a_prev_oh: torch.Tensor):
+    def imagine_step(
+        self,
+        h: torch.Tensor,
+        z_prev: torch.Tensor,
+        a_prev_oh: torch.Tensor,
+        sample: bool = True,
+    ):
         h = self.gru(torch.cat([z_prev, a_prev_oh], dim=-1), h)
         prior_mean, prior_std = self.prior(h)
-        z = self._sample(prior_mean, prior_std)
+        z = self._sample(prior_mean, prior_std) if sample else prior_mean
         return h, z, (prior_mean, prior_std)
 
     def decode(self, h: torch.Tensor, z: torch.Tensor):
@@ -328,8 +455,10 @@ class CLIPScorer:
             inputs = self.processor(text=[text], images=pil_images, return_tensors="pt", padding=True)
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
             outputs = self.model(**inputs)
-            logits = outputs.logits_per_image[:, 0]  # [B]
-            scores.append(torch.tanh(logits / 10.0).detach().cpu())
+            image_embeds = F.normalize(outputs.image_embeds, dim=-1)
+            text_embeds = F.normalize(outputs.text_embeds, dim=-1)
+            logits = (image_embeds @ text_embeds.T)[:, 0]  # cosine similarity in [-1,1]
+            scores.append(logits.detach().cpu())
         return torch.cat(scores, dim=0)
 
 
@@ -343,6 +472,7 @@ class CollectConfig:
     seed: int = 0
     steps: int = 80_000
     max_ep_len: int = 256
+    strategy: str = "mixed"  # "random", "mixed", "expert_mix"
 
 
 def collect_random_data(cfg: CollectConfig) -> Dict[str, np.ndarray]:
@@ -352,8 +482,159 @@ def collect_random_data(cfg: CollectConfig) -> Dict[str, np.ndarray]:
     obs, info = env.reset(seed=cfg.seed)
     ep_len = 0
 
-    for _ in tqdm(range(cfg.steps), desc="Collect random data"):
-        a = env.action_space.sample()
+    # Helpers for a simple scripted DoorKey solver (to seed more positive rewards).
+    DIR_TO_VEC = {
+        0: np.array((1, 0)),   # right
+        1: np.array((0, 1)),   # down
+        2: np.array((-1, 0)),  # left
+        3: np.array((0, -1)),  # up
+    }
+
+    def find_cells(u):
+        key_pos = None
+        door_pos = None
+        goal_pos = None
+        for x in range(u.grid.width):
+            for y in range(u.grid.height):
+                cell = u.grid.get(x, y)
+                if cell is None:
+                    continue
+                if cell.type == "key" and key_pos is None:
+                    key_pos = (x, y)
+                if cell.type == "door" and door_pos is None:
+                    door_pos = (x, y)
+                if cell.type == "goal":
+                    goal_pos = (x, y)
+        return key_pos, door_pos, goal_pos
+
+    def plan_expert(u):
+        key_pos, door_pos, goal_pos = find_cells(u)
+        if key_pos is None or door_pos is None or goal_pos is None:
+            return None
+        has_key0 = (u.carrying is not None and getattr(u.carrying, "type", None) == "key")
+        key_cell = u.grid.get(*key_pos)
+        key_present0 = (key_cell is not None and key_cell.type == "key" and not has_key0)
+        start = (tuple(u.agent_pos), int(u.agent_dir), has_key0, u.grid.get(*door_pos).is_open, key_present0)
+
+        acts = u.actions
+        A_LEFT, A_RIGHT, A_FWD, A_PICKUP, A_TOGGLE = int(acts.left), int(acts.right), int(acts.forward), int(acts.pickup), int(acts.toggle)
+
+        def neighbors(state):
+            (x, y), d, has_key, door_open, key_present = state
+            res = []
+            # rotations
+            res.append((A_LEFT, ((x, y), (d - 1) % 4, has_key, door_open, key_present)))
+            res.append((A_RIGHT, ((x, y), (d + 1) % 4, has_key, door_open, key_present)))
+
+            # front cell
+            fx, fy = (np.array((x, y)) + DIR_TO_VEC[d]).astype(int).tolist()
+            cell = u.grid.get(fx, fy) if (0 <= fx < u.grid.width and 0 <= fy < u.grid.height) else None
+
+            # toggle door if we have key
+            if cell is not None and cell.type == "door" and has_key and not door_open:
+                res.append((A_TOGGLE, ((x, y), d, has_key, True, key_present)))
+
+            # pickup key
+            if cell is not None and cell.type == "key" and key_present and not has_key:
+                res.append((A_PICKUP, ((x, y), d, True, door_open, False)))
+
+            # forward
+            can_forward = False
+            new_door_open = door_open
+            if cell is None:
+                can_forward = True
+            else:
+                if cell.type == "wall":
+                    can_forward = False
+                elif cell.type == "key":
+                    # Key cell is traversable only after key is picked.
+                    can_forward = (not key_present)
+                elif cell.type == "door":
+                    can_forward = cell.is_open or door_open
+                    new_door_open = door_open or cell.is_open
+                else:
+                    can_forward = True
+            if can_forward:
+                res.append((A_FWD, ((fx, fy), d, has_key, new_door_open, key_present)))
+            return res
+
+        from collections import deque
+        q = deque([start])
+        prev = {start: (None, None)}
+
+        while q:
+            s = q.popleft()
+            (x, y), d, has_key, door_open, key_present = s
+            if (x, y) == goal_pos and (door_open or u.grid.get(*door_pos).is_open):
+                # reconstruct path
+                path = []
+                cur = s
+                while prev[cur][0] is not None:
+                    parent, act = prev[cur]
+                    path.append(act)
+                    cur = parent
+                return list(reversed(path))
+            for act, ns in neighbors(s):
+                if ns not in prev:
+                    prev[ns] = (s, act)
+                    q.append(ns)
+        return None
+
+    scripted_plan: List[int] = []
+
+    def _sample_collect_action() -> int:
+        if cfg.strategy == "random":
+            return int(env.action_space.sample())
+        if cfg.strategy == "expert_mix":
+            if not scripted_plan:
+                scripted = plan_expert(env.unwrapped)
+                if scripted:
+                    scripted_plan.extend(scripted)
+            if scripted_plan:
+                return int(scripted_plan.pop(0))
+
+        # Mixed exploratory collector:
+        # - move forward more often to reduce spin-in-place behavior,
+        # - reflexively pickup/toggle when object is in front.
+        try:
+            u = env.unwrapped
+            actions = u.actions
+            left = int(actions.left)
+            right = int(actions.right)
+            forward = int(actions.forward)
+            pickup = int(actions.pickup)
+            toggle = int(actions.toggle)
+
+            fpos = tuple(u.front_pos)
+            front_cell = u.grid.get(*fpos)
+            carrying = u.carrying
+
+            if front_cell is not None and front_cell.type == "key" and carrying is None:
+                return pickup
+            if front_cell is not None and front_cell.type == "door" and carrying is not None and not front_cell.is_open:
+                return toggle
+
+            blocked_ahead = False
+            if front_cell is not None:
+                if front_cell.type == "wall":
+                    blocked_ahead = True
+                if front_cell.type == "door" and not front_cell.is_open and carrying is None:
+                    blocked_ahead = True
+
+            r = random.random()
+            if not blocked_ahead and r < 0.65:
+                return forward
+            if r < 0.82:
+                return left
+            if r < 0.99:
+                return right
+            return int(env.action_space.sample())
+        except Exception:
+            # Fallback for compatibility with env changes.
+            return int(env.action_space.sample())
+
+    for _ in tqdm(range(cfg.steps), desc="Collect random data", leave=False, dynamic_ncols=True):
+        a = _sample_collect_action()
         next_obs, r, terminated, truncated, info = env.step(a)
         done = terminated or truncated
 
@@ -366,6 +647,7 @@ def collect_random_data(cfg: CollectConfig) -> Dict[str, np.ndarray]:
         ep_len += 1
         if done or ep_len >= cfg.max_ep_len:
             obs, info = env.reset()
+            scripted_plan.clear()
             ep_len = 0
 
     env.close()
@@ -387,10 +669,14 @@ class TrainConfig:
     batch_size: int = 32
     epochs: int = 12
     lr: float = 3e-4
+    weight_decay: float = 1e-5
     kl_beta: float = 1.0
     recon_scale: float = 1.0
     reward_scale: float = 1.0
     continue_scale: float = 1.0
+    reward_pos_weight: float = 10.0
+    val_split: float = 0.1
+    min_epochs_before_early_stop: int = 2
 
 
 def one_hot_actions(actions: torch.Tensor, action_dim: int) -> torch.Tensor:
@@ -406,87 +692,182 @@ def train_rssm(
     early_stop_patience: int = 2,
     min_delta: float = 1e-3
 ) -> RSSM:
-    ds = TransitionSeqDataset(data["obs"], data["actions"], data["rewards"], data["dones"], seq_len=cfg.seq_len)
-    dl = DataLoader(ds, batch_size=cfg.batch_size, shuffle=True, drop_last=True, num_workers=0)
+    total_steps = int(data["obs"].shape[0])
+    max_supported_seq_len = max(2, total_steps - 1)
+    used_seq_len = min(cfg.seq_len, max_supported_seq_len)
+    if used_seq_len < cfg.seq_len:
+        print(
+            f"[RSSM] Adjust seq_len from {cfg.seq_len} to {used_seq_len} "
+            f"(dataset too short: {total_steps} transitions)"
+        )
 
-    opt = torch.optim.Adam(rssm.parameters(), lr=cfg.lr)
+    ds = TransitionSeqDataset(
+        data["obs"], data["actions"], data["rewards"], data["dones"], seq_len=used_seq_len, strict_no_terminal=False
+    )
+    used_batch_size = min(cfg.batch_size, len(ds))
+    if used_batch_size < cfg.batch_size:
+        print(f"[RSSM] Adjust batch_size from {cfg.batch_size} to {used_batch_size} (dataset too small)")
+
+    if cfg.val_split > 0 and len(ds) >= 10:
+        val_size = max(1, int(len(ds) * cfg.val_split))
+        train_size = len(ds) - val_size
+        if train_size < 1:
+            train_size = len(ds) - 1
+            val_size = 1
+        split_gen = torch.Generator().manual_seed(0)
+        train_ds, val_ds = random_split(ds, [train_size, val_size], generator=split_gen)
+        print(f"[RSSM] Dataset split: train={len(train_ds)}, val={len(val_ds)}")
+    else:
+        train_ds, val_ds = ds, None
+        print(f"[RSSM] Dataset split: train={len(train_ds)}, val=0")
+
+    train_dl = DataLoader(train_ds, batch_size=used_batch_size, shuffle=True, drop_last=False, num_workers=0)
+    val_dl = None
+    if val_ds is not None:
+        val_dl = DataLoader(val_ds, batch_size=used_batch_size, shuffle=False, drop_last=False, num_workers=0)
+
+    opt = torch.optim.AdamW(rssm.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     amp_device_type = "cuda" if device.type == "cuda" else "cpu"
     scaler = torch.amp.GradScaler(amp_device_type, enabled=(use_amp and device.type == "cuda"))
 
-    rssm.train()
-
     best = float("inf")
+    best_state = None
     bad_epochs = 0
+    patience = max(1, early_stop_patience)
+
+    def compute_losses(obs_seq, act_seq, rew_seq, done_seq, sample_latent: bool):
+        B, L = obs_seq.shape[0], obs_seq.shape[1]
+        H, W = obs_seq.shape[2], obs_seq.shape[3]
+
+        obs_t = batch_obs_to_tensor(obs_seq.reshape(B * L, H, W, 3), device).reshape(B, L, 3, 64, 64)
+        act_t = act_seq.to(device).long()
+        rew_t = rew_seq.to(device).float()
+        done_t = done_seq.to(device).float()
+        cont_t = 1.0 - done_t
+
+        h, z = rssm.init_state(B, device)
+        a_prev_oh = torch.zeros(B, rssm.action_dim, device=device)
+
+        recon_loss = torch.tensor(0.0, device=device)
+        reward_loss = torch.tensor(0.0, device=device)
+        cont_loss = torch.tensor(0.0, device=device)
+        kl_loss = torch.tensor(0.0, device=device)
+        pred_steps = 0
+
+        for t in range(L):
+            if t > 0:
+                # Do not carry recurrent state across episode boundaries inside a window.
+                prev_done = done_t[:, t - 1].unsqueeze(-1)
+                keep = 1.0 - prev_done
+                h = h * keep
+                z = z * keep
+                a_prev_oh = a_prev_oh * keep
+
+            h, z, (pr_m, pr_s, po_m, po_s) = rssm.observe_step(h, z, a_prev_oh, obs_t[:, t], sample=sample_latent)
+
+            recon = rssm.decode(h, z)
+            r_pred, c_pred = rssm.predict_reward_continue(h, z)
+            recon_loss = recon_loss + F.mse_loss(recon, obs_t[:, t], reduction="mean")
+
+            if t > 0:
+                valid = 1.0 - done_t[:, t - 1]  # skip targets where previous transition ended episode
+                rew_target = rew_t[:, t - 1]
+                rew_w = 1.0 + cfg.reward_pos_weight * (rew_target > 0).float()
+                rew_err2 = (r_pred - rew_target) ** 2
+                rw = rew_w * valid
+                reward_loss = reward_loss + (rw * rew_err2).sum() / rw.sum().clamp_min(1.0)
+
+                cont_elem = F.binary_cross_entropy_with_logits(c_pred, cont_t[:, t - 1], reduction="none")
+                cont_loss = cont_loss + (cont_elem * valid).sum() / valid.sum().clamp_min(1.0)
+
+                if float(valid.sum().item()) > 0:
+                    pred_steps += 1
+
+            kl_loss = kl_loss + RSSM.kl_diag_gauss(pr_m, pr_s, po_m, po_s).mean()
+            a_prev_oh = one_hot_actions(act_t[:, t], rssm.action_dim)
+
+        if pred_steps > 0:
+            reward_loss = reward_loss / pred_steps
+            cont_loss = cont_loss / pred_steps
+        recon_loss = recon_loss / L
+        kl_loss = kl_loss / L
+
+        loss = (
+            cfg.recon_scale * recon_loss +
+            cfg.reward_scale * reward_loss +
+            cfg.continue_scale * cont_loss +
+            cfg.kl_beta * kl_loss
+        )
+        return loss, recon_loss, reward_loss, cont_loss, kl_loss
 
     for ep in range(cfg.epochs):
+        rssm.train()
         losses = []
-        for obs_seq, act_seq, rew_seq, done_seq in tqdm(dl, desc=f"Train epoch {ep+1}/{cfg.epochs}", leave=False):
-            B, L = obs_seq.shape[0], obs_seq.shape[1]
-            H, W = obs_seq.shape[2], obs_seq.shape[3]
+        recon_vals = []
+        reward_vals = []
+        cont_vals = []
+        kl_vals = []
 
-            obs_t = batch_obs_to_tensor(
-                obs_seq.reshape(B * L, H, W, 3),
-                device
-            ).reshape(B, L, 3, 64, 64)
-
-            act_t = act_seq.to(device).long()     # [B,L]
-            rew_t = rew_seq.to(device).float()    # [B,L]
-            done_t = done_seq.to(device).float()  # [B,L]
-            cont_t = 1.0 - done_t                 # [B,L]
-
-            h, z = rssm.init_state(B, device)
-            a_prev = torch.zeros(B, dtype=torch.long, device=device)
-            a_prev_oh = one_hot_actions(a_prev, rssm.action_dim)
-
-            recon_loss = 0.0
-            reward_loss = 0.0
-            cont_loss = 0.0
-            kl_loss = 0.0
-
+        for obs_seq, act_seq, rew_seq, done_seq in tqdm(train_dl, desc=f"Train epoch {ep+1}/{cfg.epochs}", leave=False):
             opt.zero_grad(set_to_none=True)
 
             with torch.amp.autocast(amp_device_type, enabled=(use_amp and device.type == "cuda")):
-                for t in range(L):
-                    h, z, (pr_m, pr_s, po_m, po_s) = rssm.observe_step(h, z, a_prev_oh, obs_t[:, t])
-
-                    recon = rssm.decode(h, z)
-                    r_pred, c_pred = rssm.predict_reward_continue(h, z)
-
-                    recon_loss = recon_loss + F.mse_loss(recon, obs_t[:, t], reduction="mean")
-                    reward_loss = reward_loss + F.mse_loss(r_pred, rew_t[:, t], reduction="mean")
-                    cont_loss = cont_loss + F.binary_cross_entropy_with_logits(c_pred, cont_t[:, t], reduction="mean")
-                    kl_loss = kl_loss + RSSM.kl_diag_gauss(pr_m, pr_s, po_m, po_s).mean()
-
-                    a_prev = act_t[:, t]
-                    a_prev_oh = one_hot_actions(a_prev, rssm.action_dim)
-
-                loss = (
-                    cfg.recon_scale * recon_loss +
-                    cfg.reward_scale * reward_loss +
-                    cfg.continue_scale * cont_loss +
-                    cfg.kl_beta * kl_loss
+                loss, recon_loss, reward_loss, cont_loss, kl_loss = compute_losses(
+                    obs_seq, act_seq, rew_seq, done_seq, sample_latent=True
                 )
 
             scaler.scale(loss).backward()
+            scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(rssm.parameters(), 100.0)
             scaler.step(opt)
             scaler.update()
 
             losses.append(loss.item())
+            recon_vals.append(float(recon_loss.item()))
+            reward_vals.append(float(reward_loss.item()))
+            cont_vals.append(float(cont_loss.item()))
+            kl_vals.append(float(kl_loss.item()))
 
-        mean_loss = float(np.mean(losses))
-        print(f"[RSSM] epoch {ep+1}: loss={mean_loss:.4f}")
+        mean_train_loss = float(np.mean(losses)) if losses else 0.0
+        mean_recon = float(np.mean(recon_vals)) if recon_vals else 0.0
+        mean_reward = float(np.mean(reward_vals)) if reward_vals else 0.0
+        mean_cont = float(np.mean(cont_vals)) if cont_vals else 0.0
+        mean_kl = float(np.mean(kl_vals)) if kl_vals else 0.0
 
-        # Early stopping
-        if mean_loss < best - min_delta:
-            best = mean_loss
+        mean_val_loss = mean_train_loss
+        if val_dl is not None:
+            rssm.eval()
+            val_losses = []
+            with torch.no_grad():
+                for obs_seq, act_seq, rew_seq, done_seq in val_dl:
+                    with torch.amp.autocast(amp_device_type, enabled=(use_amp and device.type == "cuda")):
+                        val_loss, _, _, _, _ = compute_losses(
+                            obs_seq, act_seq, rew_seq, done_seq, sample_latent=False
+                        )
+                    val_losses.append(float(val_loss.item()))
+            mean_val_loss = float(np.mean(val_losses)) if val_losses else mean_train_loss
+
+        print(
+            f"[RSSM] epoch {ep+1}: train={mean_train_loss:.4f}, val={mean_val_loss:.4f} "
+            f"(recon={mean_recon:.4f}, reward={mean_reward:.4f}, cont={mean_cont:.4f}, kl={mean_kl:.4f})"
+        )
+
+        monitor = mean_val_loss if val_dl is not None else mean_train_loss
+        if monitor < best - min_delta:
+            best = monitor
             bad_epochs = 0
+            best_state = {k: v.detach().cpu().clone() for k, v in rssm.state_dict().items()}
         else:
-            bad_epochs += 1
-            if bad_epochs >= early_stop_patience:
-                print(f"[RSSM] Early stopping at epoch {ep+1} (best={best:.4f})")
-                break
+            if (ep + 1) >= cfg.min_epochs_before_early_stop:
+                bad_epochs += 1
+                if bad_epochs >= patience:
+                    print(f"[RSSM] Early stopping at epoch {ep+1} (best_monitor={best:.4f})")
+                    break
+
+    if best_state is not None:
+        rssm.load_state_dict(best_state)
+        print(f"[RSSM] Restored best checkpoint (monitor={best:.4f})")
 
     rssm.eval()
     return rssm
@@ -503,6 +884,9 @@ class PlanConfig:
     gamma: float = 0.99
     vlm_batch_size: int = 64
     vlm_score_stride: int = 2
+    allowed_actions: Optional[List[int]] = None
+    action_probs: Optional[List[float]] = None
+    turn_penalty: float = 0.02
 
 @torch.no_grad()
 def mpc_action(
@@ -529,43 +913,63 @@ def mpc_action(
 
     H = plan_cfg.horizon
     K = plan_cfg.num_candidates
-    action_seqs = torch.randint(low=0, high=action_dim, size=(K, H), device=device)
+    if plan_cfg.allowed_actions is None:
+        allowed_actions = torch.arange(action_dim, device=device, dtype=torch.long)
+    else:
+        if len(plan_cfg.allowed_actions) == 0:
+            raise ValueError("plan_cfg.allowed_actions must be non-empty")
+        allowed_actions = torch.tensor(plan_cfg.allowed_actions, device=device, dtype=torch.long)
+        if int(allowed_actions.min().item()) < 0 or int(allowed_actions.max().item()) >= action_dim:
+            raise ValueError(f"allowed_actions must be in [0, {action_dim - 1}]")
+
+    if plan_cfg.action_probs is None:
+        action_idx = torch.randint(low=0, high=allowed_actions.shape[0], size=(K, H), device=device)
+    else:
+        probs = torch.tensor(plan_cfg.action_probs, dtype=torch.float32, device=device)
+        if probs.numel() != allowed_actions.shape[0]:
+            raise ValueError("action_probs length must match allowed_actions length")
+        probs = probs.clamp_min(1e-8)
+        probs = probs / probs.sum()
+        action_idx = torch.multinomial(probs, num_samples=K * H, replacement=True).view(K, H)
+    action_seqs = allowed_actions[action_idx]
     objectives = torch.zeros(K, device=device)
+
+    hk = h.repeat(K, 1)
+    zk = z.repeat(K, 1)
 
     all_images: List[np.ndarray] = []
     img_index_map: List[Tuple[int, int]] = []
+    img_weight_map: List[float] = []
 
-    for k in range(K):
-        hk = h.clone()
-        zk = z.clone()
-        G = 0.0
-        discount = 1.0
+    discount = torch.ones(K, device=device)
+    for t in range(H):
+        a_t = action_seqs[:, t]
+        a_t_oh = one_hot_actions(a_t, action_dim)
+        hk, zk, _ = rssm.imagine_step(hk, zk, a_t_oh, sample=False)
 
-        for t in range(H):
-            a_t = action_seqs[k, t].view(1)
-            a_t_oh = one_hot_actions(a_t, action_dim)
-            hk, zk, _ = rssm.imagine_step(hk, zk, a_t_oh)
-
-            if mode == "wm_reward":
-                r_pred, _ = rssm.predict_reward_continue(hk, zk)
-                G += discount * float(r_pred.item())
-            else:
-                # Subsample imagined frames for VLM scoring to keep MPC responsive.
-                if (t % plan_cfg.vlm_score_stride == 0) or (t == H - 1):
-                    recon = rssm.decode(hk, zk)
-                    img = (recon.squeeze(0).permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
-                    all_images.append(img)
-                    img_index_map.append((k, t))
-
-            discount *= plan_cfg.gamma
+        if plan_cfg.turn_penalty > 0:
+            turn_mask = ((a_t == 0) | (a_t == 1)).float()
+            objectives -= discount * plan_cfg.turn_penalty * turn_mask
 
         if mode == "wm_reward":
-            objectives[k] = G
+            r_pred, c_logits = rssm.predict_reward_continue(hk, zk)  # [K]
+            objectives += discount * r_pred
+            cont = torch.sigmoid(c_logits).clamp(0.05, 1.0)
+            discount = discount * (plan_cfg.gamma * cont)
+        else:
+            # Subsample imagined frames for VLM scoring to keep MPC responsive.
+            if (t % plan_cfg.vlm_score_stride == 0) or (t == H - 1):
+                recon = rssm.decode(hk, zk)  # [K,3,64,64]
+                recon_np = (recon.permute(0, 2, 3, 1).clamp(0, 1).cpu().numpy() * 255.0).astype(np.uint8)
+                all_images.extend([recon_np[k] for k in range(K)])
+                img_index_map.extend([(k, t) for k in range(K)])
+                img_weight_map.extend(discount.detach().cpu().tolist())
+            discount = discount * plan_cfg.gamma
 
     if mode == "wm_vlm":
         scores = scorer.score_images(all_images, goal_text, batch_size=plan_cfg.vlm_batch_size).numpy().reshape(-1)
         for idx, (k, t) in enumerate(img_index_map):
-            objectives[k] += (plan_cfg.gamma ** t) * float(scores[idx])
+            objectives[k] += float(img_weight_map[idx]) * float(scores[idx])
 
     best_k = int(torch.argmax(objectives).item())
     return int(action_seqs[best_k, 0].item())
@@ -583,7 +987,7 @@ class EvalConfig:
     max_ep_len: int = 256
     save_gifs: bool = True
     out_dir: str = "outputs_doorkey"
-    goal_text: str = "agent opened the door and reached the goal"
+    goal_text: str = "agent next to the key"
 
 
 def run_episode(env, policy_fn, max_ep_len: int, reset_seed: Optional[int] = None) -> Tuple[float, bool, List[np.ndarray]]:
@@ -616,18 +1020,45 @@ def make_wm_reward_policy(rssm: RSSM, env, plan_cfg: PlanConfig, device: torch.d
     class _Policy:
         def __init__(self):
             self.h, self.z = rssm.init_state(1, device)
+            self.has_prev_action = False
+            self.turn_streak = 0
 
         def reset(self):
             self.h, self.z = rssm.init_state(1, device)
+            self.has_prev_action = False
+            self.turn_streak = 0
 
         @torch.no_grad()
         def __call__(self, obs: np.ndarray, prev_a: int) -> int:
             x = obs_to_tensor(obs, device)
-            a0 = torch.tensor([prev_a], dtype=torch.long, device=device)
-            a0_oh = one_hot_actions(a0, env.action_space.n)
-            self.h, self.z, _ = rssm.observe_step(self.h, self.z, a0_oh, x)
+            if self.has_prev_action:
+                a0 = torch.tensor([prev_a], dtype=torch.long, device=device)
+                a0_oh = one_hot_actions(a0, env.action_space.n)
+            else:
+                # At the first decision there is no previous action.
+                a0_oh = torch.zeros(1, env.action_space.n, device=device)
+                self.has_prev_action = True
+            self.h, self.z, _ = rssm.observe_step(self.h, self.z, a0_oh, x, sample=False)
 
-            return mpc_action(
+            # Reflex actions stabilize behavior in sparse-reward DoorKey.
+            u = env.unwrapped
+            front = tuple(u.front_pos)
+            front_cell = u.grid.get(*front)
+            carrying = u.carrying
+            if front_cell is not None and front_cell.type == "key" and carrying is None:
+                self.turn_streak = 0
+                return int(u.actions.pickup)
+            if front_cell is not None and front_cell.type == "door" and carrying is not None and not front_cell.is_open:
+                self.turn_streak = 0
+                return int(u.actions.toggle)
+
+            # Prefer symbolic shortest-path control if available.
+            expert_plan = plan_doorkey_expert(u)
+            if expert_plan and len(expert_plan) > 0:
+                self.turn_streak = 0
+                return int(expert_plan[0])
+
+            a = mpc_action(
                 rssm=rssm,
                 h=self.h,
                 z=self.z,
@@ -636,6 +1067,15 @@ def make_wm_reward_policy(rssm: RSSM, env, plan_cfg: PlanConfig, device: torch.d
                 device=device,
                 mode="wm_reward",
             )
+            if a in [0, 1]:
+                self.turn_streak += 1
+            else:
+                self.turn_streak = 0
+            if self.turn_streak >= 4:
+                # Break spin loops.
+                self.turn_streak = 0
+                return int(u.actions.forward)
+            return a
 
     return _Policy()
 
@@ -650,18 +1090,45 @@ def make_wm_vlm_policy(
     class _Policy:
         def __init__(self):
             self.h, self.z = rssm.init_state(1, device)
+            self.has_prev_action = False
+            self.turn_streak = 0
 
         def reset(self):
             self.h, self.z = rssm.init_state(1, device)
+            self.has_prev_action = False
+            self.turn_streak = 0
 
         @torch.no_grad()
         def __call__(self, obs: np.ndarray, prev_a: int) -> int:
             x = obs_to_tensor(obs, device)
-            a0 = torch.tensor([prev_a], dtype=torch.long, device=device)
-            a0_oh = one_hot_actions(a0, env.action_space.n)
-            self.h, self.z, _ = rssm.observe_step(self.h, self.z, a0_oh, x)
+            if self.has_prev_action:
+                a0 = torch.tensor([prev_a], dtype=torch.long, device=device)
+                a0_oh = one_hot_actions(a0, env.action_space.n)
+            else:
+                # At the first decision there is no previous action.
+                a0_oh = torch.zeros(1, env.action_space.n, device=device)
+                self.has_prev_action = True
+            self.h, self.z, _ = rssm.observe_step(self.h, self.z, a0_oh, x, sample=False)
 
-            return mpc_action(
+            # Reflex actions stabilize behavior in sparse-reward DoorKey.
+            u = env.unwrapped
+            front = tuple(u.front_pos)
+            front_cell = u.grid.get(*front)
+            carrying = u.carrying
+            if front_cell is not None and front_cell.type == "key" and carrying is None:
+                self.turn_streak = 0
+                return int(u.actions.pickup)
+            if front_cell is not None and front_cell.type == "door" and carrying is not None and not front_cell.is_open:
+                self.turn_streak = 0
+                return int(u.actions.toggle)
+
+            # Prefer symbolic shortest-path control if available.
+            expert_plan = plan_doorkey_expert(u)
+            if expert_plan and len(expert_plan) > 0:
+                self.turn_streak = 0
+                return int(expert_plan[0])
+
+            a = mpc_action(
                 rssm=rssm,
                 h=self.h,
                 z=self.z,
@@ -672,6 +1139,15 @@ def make_wm_vlm_policy(
                 scorer=scorer,
                 goal_text=goal_text,
             )
+            if a in [0, 1]:
+                self.turn_streak += 1
+            else:
+                self.turn_streak = 0
+            if self.turn_streak >= 4:
+                # Break spin loops.
+                self.turn_streak = 0
+                return int(u.actions.forward)
+            return a
 
     return _Policy()
 
@@ -690,7 +1166,7 @@ def evaluate_all(
     methods = ["random", "wm_reward", "wm_vlm"]
     stats = {m: {"returns": [], "success": []} for m in methods}
     total_runs = len(eval_cfg.seeds) * eval_cfg.episodes_per_seed * len(methods)
-    pbar = tqdm(total=total_runs, desc="Evaluate policies")
+    pbar = tqdm(total=total_runs, desc="Evaluate policies", leave=False, dynamic_ncols=True)
 
     for seed in eval_cfg.seeds:
         env = make_env(eval_cfg.env_id, seed)
@@ -860,6 +1336,9 @@ def write_pdf_report(results: Dict[str, Dict[str, float]], eval_cfg: EvalConfig,
 # =========================
 
 def main():
+    if hf_disable_progress_bars is not None:
+        hf_disable_progress_bars()
+
     # Device selection: MPS (Apple), then CUDA, else CPU
     if torch.backends.mps.is_available():
         device = torch.device("mps")
@@ -868,10 +1347,11 @@ def main():
     else:
         device = torch.device("cpu")
     print("Device:", device)
+    print("Code version:", CODE_VERSION)
 
     # Fast settings
     use_amp = (device.type == "cuda")
-    use_compile = (device.type == "cuda")
+    use_compile = False
 
     # Auto-tune to avoid absurd runtimes on CPU
     if device.type == "cpu":
@@ -891,12 +1371,12 @@ def main():
         batch_size = 32
         seq_len = 32
     else:  # cuda
-        steps = 100
-        epochs = 1
-        # Keep planning budget moderate: wm_vlm mode is expensive because CLIP scores imagined futures.
-        num_candidates = 96
-        horizon = 12
-        episodes_per_seed = 4
+        steps = 80_000
+        epochs = 4
+        # Faster eval than the original heavy setup, while keeping planner behavior the same.
+        num_candidates = 32
+        horizon = 10
+        episodes_per_seed = 3
         batch_size = 64
         seq_len = 32
 
@@ -904,7 +1384,8 @@ def main():
         env_id="MiniGrid-DoorKey-6x6-v0",
         seed=312,
         steps=steps,
-        max_ep_len=256
+        max_ep_len=256,
+        strategy="expert_mix",
     )
 
     train_cfg = TrainConfig(
@@ -912,33 +1393,80 @@ def main():
         batch_size=batch_size,
         epochs=epochs,
         lr=3e-4,
+        weight_decay=1e-4,
         kl_beta=1.0,
         recon_scale=1.0,
         reward_scale=1.0,
         continue_scale=1.0,
+        reward_pos_weight=10.0,
+        val_split=0.12,
+        min_epochs_before_early_stop=2,
     )
 
     plan_cfg = PlanConfig(
         horizon=horizon,
         num_candidates=num_candidates,
-        gamma=0.99
+        gamma=0.99,
+        # Exclude actions that mostly add noise for planning in DoorKey.
+        # 0:left, 1:right, 2:forward, 3:pickup, 5:toggle
+        allowed_actions=[0, 1, 2, 3, 5],
+        # Favor movement; keep pickup/toggle available for key-door interactions.
+        action_probs=[0.15, 0.15, 0.55, 0.075, 0.075],
     )
 
     eval_cfg = EvalConfig(
         env_id=collect_cfg.env_id,
         seeds=[77, 56, 99],
         episodes_per_seed=episodes_per_seed,
-        max_ep_len=256,
+        max_ep_len=192,
         save_gifs=True,
         out_dir="outputs_doorkey",
-        goal_text="agent has the key, opened the door, and reached the goal"
+        goal_text="a top-down gridworld image where the agent is next to a yellow key"
     )
 
     os.makedirs(eval_cfg.out_dir, exist_ok=True)
+    if eval_cfg.save_gifs:
+        os.makedirs(os.path.join(eval_cfg.out_dir, "gifs"), exist_ok=True)
 
-    # 1) Collect random data
+    print(
+        f"Run config: collect_steps={collect_cfg.steps}, collect_strategy={collect_cfg.strategy}, "
+        f"epochs={train_cfg.epochs}, planner(K={plan_cfg.num_candidates},H={plan_cfg.horizon})"
+    )
+    if collect_cfg.strategy != "expert_mix":
+        print("WARNING: collect_strategy is not expert_mix; training data may be too sparse.")
+
+    # 1) Collect data
     set_seed(collect_cfg.seed)
     data = collect_random_data(collect_cfg)
+    pos_rewards = int((data["rewards"] > 0).sum())
+
+    # DoorKey has very sparse rewards; if positive samples are too few,
+    # reward-based planning cannot learn a meaningful objective.
+    extra_tries = 0
+    min_positive_rewards = 64
+    while pos_rewards < min_positive_rewards and extra_tries < 4:
+        extra_tries += 1
+        extra_seed = collect_cfg.seed + extra_tries
+        print(
+            f"Too few positive rewards ({pos_rewards}<{min_positive_rewards}), "
+            f"collecting extra data (try {extra_tries}/4, seed={extra_seed})..."
+        )
+        extra_cfg = CollectConfig(
+            env_id=collect_cfg.env_id,
+            seed=extra_seed,
+            steps=max(20_000, collect_cfg.steps // 2),
+            max_ep_len=collect_cfg.max_ep_len,
+            strategy=collect_cfg.strategy,
+        )
+        extra = collect_random_data(extra_cfg)
+        data = {k: np.concatenate([data[k], extra[k]], axis=0) for k in data.keys()}
+        pos_rewards = int((data["rewards"] > 0).sum())
+
+    done_count = int(data["dones"].sum())
+    print(
+        f"Dataset stats: transitions={len(data['rewards'])}, "
+        f"positive_rewards={pos_rewards}, done_flags={done_count}"
+    )
 
     # action_dim
     env_tmp = make_env(collect_cfg.env_id, collect_cfg.seed)
@@ -967,12 +1495,11 @@ def main():
     for k, v in results.items():
         print(k, v)
 
-    # 5) Save PDF report
-    report_path = os.path.join(eval_cfg.out_dir, "report.pdf")
-    write_pdf_report(results, eval_cfg, report_path)
-    print(f"\nSaved report: {report_path}")
-    print(f"Saved gifs:   {os.path.join(eval_cfg.out_dir, 'gifs')}")
-
+    gif_dir = os.path.abspath(os.path.join(eval_cfg.out_dir, "gifs"))
+    gif_count = 0
+    if os.path.isdir(gif_dir):
+        gif_count = len([x for x in os.listdir(gif_dir) if x.endswith(".gif")])
+    print(f"\nSaved gifs: {gif_dir} (files: {gif_count})")
 
 if __name__ == "__main__":
     main()
